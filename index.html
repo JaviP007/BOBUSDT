@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>USDT/BOB Chart & Order Book</title>
+  <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+  <style>
+    body { margin:0; height:100vh; display:flex; overflow:hidden; font-family:sans-serif; }
+    #left { flex:0 0 60%; display:flex; flex-direction:column; border-right:1px solid #ccc; }
+    #right { flex:0 0 40%; display:flex; padding:10px; box-sizing:border-box; background:#f9f9f9; overflow-y:auto; }
+    
+    .spinner {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 40px;
+      height: 40px;
+      border: 4px solid #f3f3f3;
+      border-top: 4px solid #3498db;
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      z-index: 1000;
+    }
+    @keyframes spin {
+      0% { transform: translate(-50%, -50%) rotate(0deg); }
+      100% { transform: translate(-50%, -50%) rotate(360deg); }
+    }
+
+    #header { background:#fff; border-bottom:1px solid #ddd; padding:8px; display:flex; align-items:center; }
+    #controls { display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+    #last-update { font-weight:bold; }
+    #controls label { margin:0 4px 0 0; white-space:nowrap; }
+    #chart-container { position:relative; flex:1; padding-bottom:30px; }
+    #chart { position:absolute; top:0; left:0; right:0; bottom:30px; }
+    #tooltip {
+      position:absolute; top:12px; left:12px; z-index:10;
+      background:rgba(255,255,255,0.95); padding:6px 10px;
+      border:1px solid #ccc; border-radius:4px; font-size:12px;
+      pointer-events:none;
+    }
+    .table-wrap { flex:1; display:flex; flex-direction:column; margin:0 5px; }
+    .table-wrap h4 { margin:0 0 4px; font-size:16px; }
+    table { width:100%; border-collapse:collapse; flex:1; overflow:auto; }
+    th,td { border:1px solid #ccc; padding:2px; font-size:9px; text-align:right; }
+    th { background:#eee; }
+    td:first-child, th:first-child { text-align:left; }
+  </style>
+</head>
+<body>
+  <div id="left">
+    <div id="header">
+      <div id="controls">
+        <span id="last-update">Last update: --:--:--</span>
+        <label for="tz">Zone:</label>
+        <select id="tz">
+          <option value="America/La_Paz" selected>La Paz</option>
+          <option value="UTC">UTC</option>
+          <option value="America/New_York">New York</option>
+          <option value="Europe/London">London</option>
+        </select>
+        <label for="tf">Period:</label>
+        <select id="tf">
+          <option value="1min">1 min</option>
+          <option value="5min">5 min</option>
+          <option value="15min">15 min</option>
+          <option value="30min">30 min</option>
+          <option value="1h" selected>1 h</option>
+          <option value="1d">1 d</option>
+        </select>
+        <label for="pt">Price:</label>
+        <select id="pt">
+          <option value="mid" selected>Mid</option>
+          <option value="buy">Buy</option>
+          <option value="sell">Sell</option>
+        </select>
+      </div>
+    </div>
+    <div id="chart-container">
+      <div id="chart"></div>
+      <div id="tooltip">O:– H:– L:– C:–</div>
+    </div>
+  </div>
+
+  <div id="right">
+    <div class="table-wrap">
+      <h4>BID</h4>
+      <table id="bid-table">
+        <thead><tr><th>Maker</th><th>Price</th><th>FIAT</th><th>USDT</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div class="table-wrap">
+      <h4>ASK</h4>
+      <table id="ask-table">
+        <thead><tr><th>Maker</th><th>Price</th><th>FIAT</th><th>USDT</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+  </div>
+
+  <script>
+    const PALETTE = [
+      '#FFFF00', '#00FF00', '#00FFFF', '#FF00FF', '#FF8C00',
+      '#ADFF2F', '#FF0000', '#0000FF', '#C71585', '#8A2BE2'
+    ];
+    
+    const chart = LightweightCharts.createChart(document.getElementById('chart'), {
+      timeScale: { timeVisible: true, secondsVisible: true },
+      layout:   { backgroundColor: '#ffffff', textColor: '#000000' },
+    });
+    const series = chart.addSeries(LightweightCharts.CandlestickSeries, {
+      upColor: '#26a69a', downColor: '#ef5350', borderVisible: false,
+      wickUpColor: '#26a69a', wickDownColor: '#ef5350',
+      priceFormat: { type: 'price', precision: 3, minMove: 0.001 }
+    });
+
+    const tfSel      = document.getElementById('tf');
+    const ptSel      = document.getElementById('pt');
+    const tzSel      = document.getElementById('tz');
+    const lastUpdate = document.getElementById('last-update');
+    const bidBody    = document.querySelector('#bid-table tbody');
+    const askBody    = document.querySelector('#ask-table tbody');
+
+    tfSel.onchange = loadAll;
+    ptSel.onchange = loadAll;
+    tzSel.onchange = loadAll;
+
+    chart.subscribeCrosshairMove(param => {
+      const data = param.seriesData.get(series);
+      if (!param.time || !data) {
+        document.getElementById('tooltip').textContent = 'O:– H:– L:– C:–';
+        return;
+      }
+      document.getElementById('tooltip').textContent =
+        `O:${data.open.toFixed(3)} H:${data.high.toFixed(3)} ` +
+        `L:${data.low.toFixed(3)} C:${data.close.toFixed(3)}`;
+    });
+
+    async function loadChart() {
+      let spinner;
+      try {
+        spinner = document.createElement('div');
+        spinner.className = 'spinner';
+        document.getElementById('chart-container').appendChild(spinner);
+        tfSel.disabled = ptSel.disabled = tzSel.disabled = true;
+
+        const tf = tfSel.value, pt = ptSel.value, tz = tzSel.value;
+        const response = await fetch(
+          `/data/price.json?tf=${tf}&tz=${encodeURIComponent(tz)}`
+        );
+        if (!response.ok) return;
+        const { buy, mid, sell, raw } = await response.json();
+
+        // set chart data (resampled)
+        series.setData(pt === 'buy'  ? buy
+                       : pt === 'sell' ? sell
+                                       : mid);
+
+        // overlay the raw last price as a micro-candle
+        const rawPrice = 
+          pt === 'buy'  ? raw.buy  :
+          pt === 'sell' ? raw.sell :
+                          raw.mid;
+
+        // overlay that price
+        series.update({
+          time:  raw.time,
+          open:  rawPrice,
+          high:  rawPrice,
+          low:   rawPrice,
+          close: rawPrice
+        });
+
+        // display raw last prices, mid with 3 decimals
+        const timeStr = new Date(raw.time * 1000).toLocaleTimeString('en-US', {
+          timeZone: tz,
+          hour12: false,
+          hour:   '2-digit',
+          minute: '2-digit',
+          second: '2-digit'
+        });
+        lastUpdate.textContent =
+          `Last update: ${timeStr}` +
+          ` | Sell: ${raw.sell.toFixed(2)}` +
+          ` | Mid: ${raw.mid.toFixed(3)}` +
+          ` | Buy: ${raw.buy.toFixed(2)}`;
+
+      } catch (err) {
+        console.error('Chart load error:', err);
+      } finally {
+        if (spinner) spinner.remove();
+        tfSel.disabled = ptSel.disabled = tzSel.disabled = false;
+      }
+    }
+
+    async function loadL2(side) {
+      try {
+        const r = await fetch(`/data/${side}.json`);
+        if (!r.ok) return;
+        const rows = await r.json();
+
+        const body = side === 'bid' ? bidBody : askBody;
+        body.innerHTML = '';
+
+        let currPrice = null, colorMap = {}, ci = 0;
+        rows.forEach(r => {
+          const tr = document.createElement('tr');
+          const total = r.maker === 'TOTAL';
+          if (r.price !== currPrice) {
+            currPrice = r.price;
+            colorMap[currPrice] = PALETTE[ci++ % PALETTE.length];
+          }
+          tr.style.backgroundColor = colorMap[currPrice];
+
+          tr.innerHTML = `
+            <td>${total ? 'TOTAL' : r.maker}</td>
+            <td>${r.price.toFixed(2)}</td>
+            <td>Bs.${r.size.toLocaleString()}</td>
+            <td>${
+              (total ? r.total_usdt : r.maker_usdt)
+                .toLocaleString(undefined, {
+                  minimumFractionDigits: 2,
+                  maximumFractionDigits: 2
+                })
+            } USDT</td>
+          `;
+          if (total) tr.style.fontWeight = 'bold';
+          body.appendChild(tr);
+        });
+      } catch (err) {
+        console.error('Error loading L2:', err);
+      }
+    }
+
+    function loadAll() {
+      loadChart();
+      loadL2('bid');
+      loadL2('ask');
+    }
+    loadAll();
+    setInterval(loadAll, 5000);
+
+    window.addEventListener('resize', () => {
+      chart.resize(
+        document.getElementById('chart-container').clientWidth,
+        document.getElementById('chart-container').clientHeight
+      );
+    });
+  </script>
+</body>
+</html>
